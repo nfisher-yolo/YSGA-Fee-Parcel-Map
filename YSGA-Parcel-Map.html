@@ -253,6 +253,22 @@
     font-family: inherit;
   }
 
+  .mode-toggle-control {
+    background: #ffffff;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 12.5px;
+    line-height: 1.6;
+  }
+  .mode-toggle-control label {
+    display: block;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .mode-toggle-control input {
+    margin-right: 5px;
+  }
+
   .apn-label {
     background: transparent;
     border: none;
@@ -628,12 +644,13 @@
 
     landCoverLayer = L.geoJSON(landCoverData, {
       renderer: canvasRenderer,
-      style: landCoverStyle
+      style: landCoverStyle,
+      interactive: false // this layer is just a backdrop; the on-click crop popups live in highlightGroup
     });
 
     L.control.layers(
       { "Map": lightBasemap, "Satellite": satelliteBasemap },
-      { "Cropped Acres (Tier 2)": landCoverLayer },
+      null,
       { position: 'topright', collapsed: false }
     ).addTo(map);
 
@@ -656,9 +673,49 @@
     }).addTo(map);
 
     // ---------------------------------------------------------------
+    // PARCELS / CROPPED ACRES TOGGLE
+    // Showing all 65k parcels and all ~13k crop polygons on the same
+    // canvas at once roughly doubles what has to be redrawn on every
+    // pan/zoom. Making these mutually exclusive — and actually
+    // removing the hidden one from the map, not just hiding it —
+    // keeps each mode as fast as it was on its own.
+    // ---------------------------------------------------------------
+
+    let layerMode = 'parcels';
+
+    function setLayerMode(mode) {
+      if (mode === layerMode) return;
+      layerMode = mode;
+      if (mode === 'parcels') {
+        if (!map.hasLayer(geoLayer)) geoLayer.addTo(map);
+        if (!map.hasLayer(hatchLayer)) hatchLayer.addTo(map);
+        if (map.hasLayer(landCoverLayer)) map.removeLayer(landCoverLayer);
+      } else {
+        if (map.hasLayer(geoLayer)) map.removeLayer(geoLayer);
+        if (map.hasLayer(hatchLayer)) map.removeLayer(hatchLayer);
+        if (!map.hasLayer(landCoverLayer)) landCoverLayer.addTo(map);
+      }
+      document.querySelectorAll('input[name="layerMode"]').forEach(r => { r.checked = (r.value === mode); });
+    }
+
+    const ModeToggle = L.Control.extend({
+      options: { position: 'topright' },
+      onAdd: function () {
+        const div = L.DomUtil.create('div', 'leaflet-bar leaflet-control mode-toggle-control');
+        div.innerHTML =
+          '<label><input type="radio" name="layerMode" value="parcels" checked> Parcels</label>' +
+          '<label><input type="radio" name="layerMode" value="cropped"> Cropped Acres (Tier 2)</label>';
+        L.DomEvent.disableClickPropagation(div);
+        div.addEventListener('change', e => setLayerMode(e.target.value));
+        return div;
+      }
+    });
+    new ModeToggle().addTo(map);
+
+    // ---------------------------------------------------------------
     // FOCUS MODE
     // Selecting a parcel dims everything else (other parcels' colors,
-    // the hatch layer, and the full land cover overlay if it's on) so
+    // the hatch layer, and the crop overlay if it's showing) so
     // attention stays on that parcel's crop mix. Clicking empty map
     // space clears the focus and restores full symbology.
     // ---------------------------------------------------------------
@@ -699,6 +756,7 @@
     });
 
     function selectParcel(layer) {
+      setLayerMode('parcels'); // search results only make sense in parcel mode
       activateParcel(layer);
       map.fitBounds(layer.getBounds(), { maxZoom: 18, padding: [40, 40] });
       layer.openPopup();
