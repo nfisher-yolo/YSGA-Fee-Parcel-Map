@@ -489,9 +489,6 @@
   );
 
   let selectedLayer = null;
-  let geoLayer = null;
-  let hatchLayer = null;
-  let landCoverLayer = null;
   let landCoverByAPN = {};
   let focusApn = null; // set when a parcel is selected, to dim everything else
   const highlightGroup = L.featureGroup().addTo(map);
@@ -614,6 +611,71 @@
   // LOAD DATA
   // ---------------------------------------------------------------
 
+  // ---------------------------------------------------------------
+  // VIEWPORT-BASED RENDERING
+  // At 65k+ parcels, redrawing everything on every pan/zoom is the
+  // real bottleneck — Canvas is fast, but it still has to repaint
+  // every shape currently attached to the map on every frame. This
+  // builds each feature's Leaflet layer once up front (cheap, one
+  // time), but only actually adds the layers near the current view
+  // to the map, swapping them in/out as you move. A dataset of any
+  // size then costs roughly the same to render as "however many
+  // parcels fit on screen," not "the whole dataset."
+  // ---------------------------------------------------------------
+
+  function buildViewportSet(features, styleFn, extraOptions, onEachFeature) {
+    const entries = new Array(features.length);
+    for (let i = 0; i < features.length; i++) {
+      const feature = features[i];
+      const layer = L.GeoJSON.geometryToLayer(
+        feature,
+        Object.assign({ renderer: canvasRenderer }, styleFn(feature), extraOptions)
+      );
+      if (onEachFeature) onEachFeature(feature, layer);
+      const b = layer.getBounds();
+      entries[i] = {
+        feature, layer,
+        minLng: b.getWest(), minLat: b.getSouth(),
+        maxLng: b.getEast(), maxLat: b.getNorth()
+      };
+    }
+
+    const group = L.layerGroup();
+    let added = new Set();
+
+    function sync(bounds) {
+      const w = bounds.getWest(), s = bounds.getSouth(), e = bounds.getEast(), n = bounds.getNorth();
+      const nowVisible = new Set();
+      for (let i = 0; i < entries.length; i++) {
+        const en = entries[i];
+        if (en.maxLng >= w && en.minLng <= e && en.maxLat >= s && en.minLat <= n) {
+          nowVisible.add(en.layer);
+          if (!added.has(en.layer)) group.addLayer(en.layer);
+        }
+      }
+      added.forEach(layer => { if (!nowVisible.has(layer)) group.removeLayer(layer); });
+      added = nowVisible;
+    }
+
+    // Only restyles what's currently on screen — stays cheap
+    // regardless of total dataset size.
+    function restyleVisible(styleFn2) {
+      added.forEach(layer => layer.setStyle(styleFn2(layer)));
+    }
+
+    // Guarantees a specific layer is rendered immediately (used when
+    // jumping to a search result that may be off-screen).
+    function include(layer) {
+      if (!added.has(layer)) { group.addLayer(layer); added.add(layer); }
+    }
+
+    return { entries, group, sync, restyleVisible, include };
+  }
+
+  // ---------------------------------------------------------------
+  // LOAD DATA
+  // ---------------------------------------------------------------
+
   Promise.all([
     fetch(PARCELS_URL).then(r => { if (!r.ok) throw new Error('parcels.geojson: ' + r.status); return r.json(); }),
     fetch(LANDCOVER_URL).then(r => { if (!r.ok) throw new Error('landcover.geojson: ' + r.status); return r.json(); })
@@ -626,61 +688,71 @@
       (landCoverByAPN[apn] = landCoverByAPN[apn] || []).push(f);
     });
 
-    landCoverLayer = L.geoJSON(landCoverData, {
-      renderer: canvasRenderer,
-      style: landCoverStyle,
-      interactive: false // this layer is just a backdrop; the on-click crop popups live in highlightGroup
-    });
-
     L.control.layers(
       { "Map": lightBasemap, "Satellite": satelliteBasemap },
       null,
       { position: 'topright', collapsed: false }
     ).addTo(map);
 
-    geoLayer = L.geoJSON(parcelData, {
-      renderer: canvasRenderer,
-      style: feature => parcelStyle(feature, false),
-      onEachFeature: (feature, layer) => {
+    const parcelsVP = buildViewportSet(
+      parcelData.features,
+      feature => parcelStyle(feature, false),
+      {},
+      (feature, layer) => {
         layer.bindPopup(`<strong>APN ${feature.properties[PARCEL_APN_FIELD]}</strong>`);
         layer.on('click', e => {
           L.DomEvent.stopPropagation(e); // don't let this bubble to the map's click-away handler
           activateParcel(layer);
         });
       }
-    }).addTo(map);
+    );
 
-    hatchLayer = L.geoJSON(parcelData, {
-      renderer: canvasRenderer,
-      filter: f => f.properties['Water System Type'] === 'C',
-      style: hatchStyleFor
-    }).addTo(map);
+    const hatchFeatures = parcelData.features.filter(f => f.properties['Water System Type'] === 'C');
+    const hatchVP = buildViewportSet(hatchFeatures, hatchStyleFor, {});
+
+    const cropVP = buildViewportSet(landCoverData.features, landCoverStyle, { interactive: false });
+
+    parcelsVP.group.addTo(map);
+    hatchVP.group.addTo(map);
 
     // ---------------------------------------------------------------
     // PARCELS / CROPPED ACRES TOGGLE
-    // Showing all 65k parcels and all ~13k crop polygons on the same
-    // canvas at once roughly doubles what has to be redrawn on every
-    // pan/zoom. Making these mutually exclusive — and actually
-    // removing the hidden one from the map, not just hiding it —
-    // keeps each mode as fast as it was on its own.
     // ---------------------------------------------------------------
 
     let layerMode = 'parcels';
+
+    function syncViewportNow() {
+      const bounds = map.getBounds().pad(0.25); // small buffer so panning doesn't pop-in shapes at the edge
+      if (layerMode === 'parcels') {
+        parcelsVP.sync(bounds);
+        hatchVP.sync(bounds);
+      } else {
+        cropVP.sync(bounds);
+      }
+    }
 
     function setLayerMode(mode) {
       if (mode === layerMode) return;
       layerMode = mode;
       if (mode === 'parcels') {
-        if (!map.hasLayer(geoLayer)) geoLayer.addTo(map);
-        if (!map.hasLayer(hatchLayer)) hatchLayer.addTo(map);
-        if (map.hasLayer(landCoverLayer)) map.removeLayer(landCoverLayer);
+        map.removeLayer(cropVP.group);
+        parcelsVP.group.addTo(map);
+        hatchVP.group.addTo(map);
       } else {
-        if (map.hasLayer(geoLayer)) map.removeLayer(geoLayer);
-        if (map.hasLayer(hatchLayer)) map.removeLayer(hatchLayer);
-        if (!map.hasLayer(landCoverLayer)) landCoverLayer.addTo(map);
+        map.removeLayer(parcelsVP.group);
+        map.removeLayer(hatchVP.group);
+        cropVP.group.addTo(map);
       }
+      syncViewportNow();
       document.querySelectorAll('input[name="layerMode"]').forEach(r => { r.checked = (r.value === mode); });
     }
+
+    let viewportSyncTimer = null;
+    function scheduleViewportSync() {
+      clearTimeout(viewportSyncTimer);
+      viewportSyncTimer = setTimeout(syncViewportNow, 100);
+    }
+    map.on('moveend zoomend', scheduleViewportSync);
 
     const ModeToggle = L.Control.extend({
       options: { position: 'topright' },
@@ -701,13 +773,15 @@
     // Selecting a parcel dims everything else (other parcels' colors,
     // the hatch layer, and the crop overlay if it's showing) so
     // attention stays on that parcel's crop mix. Clicking empty map
-    // space clears the focus and restores full symbology.
+    // space clears the focus and restores full symbology. Only
+    // currently-visible layers get restyled — cheap regardless of
+    // total dataset size.
     // ---------------------------------------------------------------
 
     function refreshAllStyles() {
-      geoLayer.eachLayer(layer => layer.setStyle(parcelStyle(layer.feature, layer === selectedLayer)));
-      hatchLayer.eachLayer(layer => layer.setStyle(hatchStyleFor(layer.feature)));
-      if (landCoverLayer) landCoverLayer.eachLayer(layer => layer.setStyle(landCoverStyle(layer.feature)));
+      parcelsVP.restyleVisible(layer => parcelStyle(layer.feature, layer === selectedLayer));
+      hatchVP.restyleVisible(layer => hatchStyleFor(layer.feature));
+      cropVP.restyleVisible(layer => landCoverStyle(layer.feature));
     }
 
     function activateParcel(layer) {
@@ -734,13 +808,14 @@
     // APN SEARCH
     // ---------------------------------------------------------------
 
-    const apnIndex = [];
-    geoLayer.eachLayer(layer => {
-      apnIndex.push({ apn: String(layer.feature.properties[PARCEL_APN_FIELD]), layer });
-    });
+    const apnIndex = parcelsVP.entries.map(entry => ({
+      apn: String(entry.feature.properties[PARCEL_APN_FIELD]),
+      layer: entry.layer
+    }));
 
     function selectParcel(layer) {
       setLayerMode('parcels'); // search results only make sense in parcel mode
+      parcelsVP.include(layer); // guarantee it's rendered even if off-screen
       activateParcel(layer);
       map.fitBounds(layer.getBounds(), { maxZoom: 18, padding: [40, 40] });
       layer.openPopup();
@@ -794,7 +869,17 @@
     document.getElementById('hint').textContent =
       'Click a parcel to see its details and crop mix.';
 
-    map.fitBounds(geoLayer.getBounds(), { padding: [30, 30] });
+    // Compute overall bounds numerically (fast) rather than via a
+    // throwaway Leaflet object per feature.
+    let minLat = Infinity, minLng = Infinity, maxLat = -Infinity, maxLng = -Infinity;
+    parcelsVP.entries.forEach(en => {
+      if (en.minLat < minLat) minLat = en.minLat;
+      if (en.minLng < minLng) minLng = en.minLng;
+      if (en.maxLat > maxLat) maxLat = en.maxLat;
+      if (en.maxLng > maxLng) maxLng = en.maxLng;
+    });
+    map.fitBounds([[minLat, minLng], [maxLat, maxLng]], { padding: [30, 30] });
+    syncViewportNow();
 
   }).catch(err => {
     document.getElementById('hint').textContent =
