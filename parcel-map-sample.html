@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Parcel Map — Sample</title>
+<title>YSGA Fee Parcel Viewer</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
 <style>
   :root {
@@ -280,7 +280,7 @@
 <div id="app">
   <div id="map"></div>
   <div id="panel">
-    <div class="brand">Parcel Viewer</div>
+    <div class="brand">YSGA Fee Parcel Viewer</div>
     <h1>Click a parcel to see its data</h1>
 
     <div class="search-wrap">
@@ -434,7 +434,7 @@
   // MAP SETUP
   // ---------------------------------------------------------------
 
-  const map = L.map('map', { zoomControl: true }).setView([38.5449, -121.7405], 15);
+  const map = L.map('map', { zoomControl: true, zoomAnimation: false }).setView([38.5449, -121.7405], 15);
 
   const lightBasemap = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
     attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
@@ -491,6 +491,7 @@
   let selectedLayer = null;
   let geoLayer = null;
   let hatchLayer = null;
+  let landCoverLayer = null;
   let landCoverByAPN = {};
   let focusApn = null; // set when a parcel is selected, to dim everything else
   const highlightGroup = L.featureGroup().addTo(map);
@@ -501,7 +502,7 @@
     return {
       color: isSelected ? '#b5502c' : (dimmed ? 'rgba(42,42,42,0.15)' : '#2a2a2a'),
       weight: isSelected ? 3 : 1,
-      fillOpacity: dimmed ? 0.05 : 0.55,
+      fillOpacity: dimmed ? 0.05 : 0.35,
       fillColor: districtColors[feature.properties.District_P] || '#999'
     };
   }
@@ -510,6 +511,17 @@
     const apn = String(feature.properties[PARCEL_APN_FIELD]);
     const dimmed = focusApn && apn !== focusApn;
     return { stroke: false, fillColor: hatchPattern, fillOpacity: dimmed ? 0.05 : 1, interactive: false };
+  }
+
+  function landCoverStyle(feature) {
+    const apn = String(feature.properties[LC_APN_FIELD]);
+    const dimmed = focusApn && apn !== focusApn;
+    return {
+      color: 'rgba(0,0,0,0.15)',
+      weight: 0.5,
+      fillColor: landCoverFill(cropLetter(feature.properties[LC_CODE_FIELD])),
+      fillOpacity: dimmed ? 0.05 : 0.65
+    };
   }
 
   // ---------------------------------------------------------------
@@ -544,7 +556,6 @@
     highlightGroup.clearLayers();
     const tbody = document.getElementById('lc-table-body');
     tbody.innerHTML = '';
-    document.getElementById('lc-total-acres').textContent = '—';
 
     const apn = String(parcelFeature.properties[PARCEL_APN_FIELD]);
     const matches = landCoverByAPN[apn] || [];
@@ -583,19 +594,18 @@
     const rows = Object.keys(totalsByClass).sort((a, b) => totalsByClass[b] - totalsByClass[a]);
 
     if (rows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="2" style="color:#5c6a5f; padding-top:8px;">No land cover data matches this parcel\'s APN.</td></tr>';
-      return;
+      tbody.innerHTML = '<tr><td colspan="2" style="color:#5c6a5f; padding-top:8px;">There are no cropped acres on this parcel.</td></tr>';
+    } else {
+      rows.forEach(cls => {
+        const acres = totalsByClass[cls];
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><span class="lc-label"><span class="swatch" style="background:${swatchByClass[cls] || '#ccc'}"></span>${cls}</span></td>
+          <td class="num">${acres.toFixed(2)}</td>
+        `;
+        tbody.appendChild(tr);
+      });
     }
-
-    rows.forEach(cls => {
-      const acres = totalsByClass[cls];
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td><span class="lc-label"><span class="swatch" style="background:${swatchByClass[cls] || '#ccc'}"></span>${cls}</span></td>
-        <td class="num">${acres.toFixed(2)}</td>
-      `;
-      tbody.appendChild(tr);
-    });
 
     document.getElementById('lc-total-acres').textContent = grandTotalAcres.toFixed(2) + ' ac';
   }
@@ -616,9 +626,14 @@
       (landCoverByAPN[apn] = landCoverByAPN[apn] || []).push(f);
     });
 
+    landCoverLayer = L.geoJSON(landCoverData, {
+      renderer: canvasRenderer,
+      style: landCoverStyle
+    });
+
     L.control.layers(
       { "Map": lightBasemap, "Satellite": satelliteBasemap },
-      null,
+      { "Cropped Acres (Tier 2)": landCoverLayer },
       { position: 'topright', collapsed: false }
     ).addTo(map);
 
@@ -651,6 +666,7 @@
     function refreshAllStyles() {
       geoLayer.eachLayer(layer => layer.setStyle(parcelStyle(layer.feature, layer === selectedLayer)));
       hatchLayer.eachLayer(layer => layer.setStyle(hatchStyleFor(layer.feature)));
+      if (landCoverLayer) landCoverLayer.eachLayer(layer => layer.setStyle(landCoverStyle(layer.feature)));
     }
 
     function activateParcel(layer) {
@@ -778,7 +794,16 @@
       labeledLayers = nowVisible;
     }
 
-    map.on('zoomend moveend', updateVisibleLabels);
+    // Debounced: zoomend and moveend often both fire for a single pan/
+    // zoom gesture, and scanning 65k cached bounds on every single
+    // firing adds up. Collapsing them into one pass per gesture keeps
+    // panning/zooming responsive.
+    let labelUpdateTimer = null;
+    function scheduleLabelUpdate() {
+      clearTimeout(labelUpdateTimer);
+      labelUpdateTimer = setTimeout(updateVisibleLabels, 120);
+    }
+    map.on('zoomend moveend', scheduleLabelUpdate);
     updateVisibleLabels();
 
     document.getElementById('hint').textContent =
